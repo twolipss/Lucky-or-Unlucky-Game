@@ -1,0 +1,237 @@
+#include "stm32f4xx.h"
+
+typedef enum { ROCK=0, PAPER, SCISSORS, NONE } Choice;
+
+#define LCD_ADDR (0x27 << 1) 
+
+/* --- Global Variables --- */
+volatile Choice player_choice = NONE;
+volatile uint8_t confirm_pressed = 0;
+volatile uint32_t system_seed = 0; 
+
+/* --- Function Prototypes --- */
+void I2C_Init(void);
+void I2C_Write_Wait(uint8_t data);
+void LCD_SendCommand(uint8_t cmd);
+void LCD_SendData(uint8_t data);
+void LCD_Init(void);
+void LCD_SendString(char *str);
+void LCD_Clear(void);
+void LCD_SetCursor(uint8_t row, uint8_t col);
+void GPIO_Init(void);
+void Interrupt_Init(void);
+void delay(volatile uint32_t t);
+Choice get_random_choice(void);
+void show_system_choice(Choice c);
+void show_player_choice(Choice c);
+void blink_active_low(GPIO_TypeDef *port, uint32_t pin, int times);
+void blink_active_high(GPIO_TypeDef *port, uint32_t pin, int times);
+
+/* --- Interrupt Subroutines (ISRs) --- */
+void EXTI0_IRQHandler(void) {
+    if (EXTI->PR & (1 << 0)) { player_choice = SCISSORS; EXTI->PR |= (1 << 0); }
+}
+void EXTI1_IRQHandler(void) {
+    if (EXTI->PR & (1 << 1)) { confirm_pressed = 1; EXTI->PR |= (1 << 1); }
+}
+void EXTI2_IRQHandler(void) {
+    if (EXTI->PR & (1 << 2)) { player_choice = ROCK; EXTI->PR |= (1 << 2); }
+}
+void EXTI3_IRQHandler(void) {
+    if (EXTI->PR & (1 << 3)) { player_choice = PAPER; EXTI->PR |= (1 << 3); }
+}
+
+/* --- Buzzer Patterns --- */
+void buzzer_win_melody(void) {
+    for(int i=0; i<3; i++) { GPIOD->ODR |= (1 << 2); delay(180000); GPIOD->ODR &= ~(1 << 2); delay(120000); }
+    GPIOD->ODR |= (1 << 2); delay(1000000); GPIOD->ODR &= ~(1 << 2);
+}
+void buzzer_lose_long(void) {
+    GPIOD->ODR |= (1 << 2); delay(12000000); GPIOD->ODR &= ~(1 << 2);
+}
+void buzzer_draw_beep(void) {
+    for(int i=0; i<2; i++) { GPIOD->ODR |= (1 << 2); delay(400000); GPIOD->ODR &= ~(1 << 2); delay(400000); }
+}
+
+/* --- Main Game Logic --- */
+int main(void) {
+    GPIO_Init(); 
+    Interrupt_Init();
+    I2C_Init();
+    LCD_Init(); 
+
+    while (1) {
+        player_choice = NONE;
+        confirm_pressed = 0;
+
+        // Reset LEDs to default states
+        GPIOA->ODR &= ~((1 << 8) | (1 << 9) | (1 << 10)); 
+        GPIOA->ODR |= (1 << 11); // PA11 is Active Low (Off = 1)
+        GPIOB->ODR &= ~((1 << 12) | (1 << 13) | (1 << 14) | (1 << 15)); // PB15 is Active High (Off = 0)
+
+        LCD_Clear();
+        LCD_SetCursor(0, 0);
+        LCD_SendString("   LET'S PLAY   ");
+        LCD_SetCursor(1, 0);
+        LCD_SendString("CHOOSE A BUTTON!");
+
+        // Scramble seed while waiting for player choice
+        while (player_choice == NONE) {
+            system_seed++; 
+        }
+        
+        show_player_choice(player_choice);
+        
+        LCD_Clear();
+        LCD_SetCursor(0, 0);
+        LCD_SendString("YOU CHOSE:");
+        LCD_SetCursor(1, 0);
+        if(player_choice == ROCK)       LCD_SendString("ROCK! PRESS OK");
+        else if(player_choice == PAPER) LCD_SendString("PAPER! PRESS OK");
+        else                            LCD_SendString("SCIS! PRESS OK");
+
+        // Continue scrambling seed while waiting for OK
+        while (confirm_pressed == 0) {
+            system_seed += SysTick->VAL; 
+        }
+
+        Choice system_choice = get_random_choice();
+        show_system_choice(system_choice);
+        
+        LCD_Clear();
+        LCD_SetCursor(0, 0);
+        LCD_SendString(player_choice == ROCK ? "P:ROCK" : (player_choice == PAPER ? "P:PAPR" : "P:SCIS"));
+        LCD_SendString(" VS ");
+        LCD_SendString(system_choice == ROCK ? "O:ROCK" : (system_choice == PAPER ? "O:PAPR" : "O:SCIS"));
+
+        LCD_SetCursor(1, 0);
+        
+        // --- DRAW LOGIC ---
+        if (player_choice == system_choice) {
+            LCD_SendString("RESULT: DRAW");
+            buzzer_draw_beep();
+            // Simultaneous blink for PA11 (Active Low) and PB15 (Active High)
+            for (int i = 0; i < 3; i++) {
+                GPIOA->ODR &= ~(1 << 11); // PA11 ON
+                GPIOB->ODR |= (1 << 15);  // PB15 ON
+                delay(800000);
+                GPIOA->ODR |= (1 << 11);  // PA11 OFF
+                GPIOB->ODR &= ~(1 << 15); // PB15 OFF
+                delay(800000);
+            }
+        } 
+        // --- WIN LOGIC ---
+        else if ((player_choice == ROCK && system_choice == SCISSORS) ||
+                   (player_choice == PAPER && system_choice == ROCK) ||
+                   (player_choice == SCISSORS && system_choice == PAPER)) {
+            LCD_SendString("RESULT: YOU WIN");
+            buzzer_win_melody();
+            blink_active_low(GPIOA, 11, 3); 
+        } 
+        // --- LOSE LOGIC ---
+        else {
+            LCD_SendString("RESULT: YOU LOSE");
+            buzzer_lose_long();
+            blink_active_high(GPIOB, 15, 3); 
+        }
+        delay(4000000); 
+    }
+}
+
+/* --- Random Choice Subroutine --- */
+Choice get_random_choice(void) {
+    return (Choice)(system_seed % 3);
+}
+
+/* --- Peripheral Initialization --- */
+void GPIO_Init(void) {
+    RCC->AHB1ENR |= (1 << 0) | (1 << 1) | (1 << 3); 
+    GPIOD->MODER |= (1 << 4); // PD2 Buzzer
+    GPIOA->MODER |= (1 << 16) | (1 << 18) | (1 << 20) | (1 << 22); // LEDs PA8-11
+    GPIOB->MODER |= (1 << 24) | (1 << 26) | (1 << 28) | (1 << 30); // LEDs PB12-15
+    
+    GPIOA->MODER &= ~((3 << 4) | (3 << 6)); // PA2, PA3 Input
+    GPIOB->MODER &= ~((3 << 0) | (3 << 2)); // PB0, PB1 Input
+    GPIOA->PUPDR |= ((2 << 4) | (2 << 6));  // Pull-down
+    GPIOB->PUPDR |= ((1 << 0) | (1 << 2));  // Pull-up
+}
+
+void Interrupt_Init(void) {
+    RCC->APB2ENR |= (1 << 14);
+    SYSCFG->EXTICR[0] &= ~0xFFFF;
+    SYSCFG->EXTICR[0] |= 0x0011; // PB0, PB1
+    EXTI->IMR |= (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3);
+    EXTI->RTSR |= (1 << 2) | (1 << 3); 
+    EXTI->FTSR |= (1 << 0) | (1 << 1);
+    NVIC_EnableIRQ(EXTI0_IRQn); NVIC_EnableIRQ(EXTI1_IRQn);
+    NVIC_EnableIRQ(EXTI2_IRQn); NVIC_EnableIRQ(EXTI3_IRQn);
+}
+
+/* --- I2C & LCD Helpers --- */
+void I2C_Init(void) {
+    RCC->AHB1ENR |= (1 << 1); RCC->APB1ENR |= (1 << 21);
+    GPIOB->MODER |= (2 << 16) | (2 << 18); GPIOB->OTYPER |= (3 << 8);
+    GPIOB->PUPDR |= (1 << 16) | (1 << 18); GPIOB->AFR[1] |= (4 << 0) | (4 << 4);
+    I2C1->CR1 |= (1 << 15); delay(100); I2C1->CR1 &= ~(1 << 15);
+    I2C1->CR2 = 16; I2C1->CCR = 80; I2C1->TRISE = 17; I2C1->CR1 |= 1; 
+}
+
+void I2C_Write_Wait(uint8_t data) {
+    I2C1->CR1 |= (1 << 8); while (!(I2C1->SR1 & 1));
+    I2C1->DR = LCD_ADDR; while (!(I2C1->SR1 & 2));
+    (void)I2C1->SR2; I2C1->DR = data; while (!(I2C1->SR1 & 0x80));
+    I2C1->CR1 |= (1 << 9); 
+}
+
+void LCD_SendCommand(uint8_t cmd) {
+    uint8_t u = (cmd & 0xf0); uint8_t l = ((cmd << 4) & 0xf0);
+    I2C_Write_Wait(u|0x0C); delay(1000); I2C_Write_Wait(u|0x08); delay(1000);
+    I2C_Write_Wait(l|0x0C); delay(1000); I2C_Write_Wait(l|0x08); delay(1000);
+}
+
+void LCD_SendData(uint8_t data) {
+    uint8_t u = (data & 0xf0); uint8_t l = ((data << 4) & 0xf0);
+    I2C_Write_Wait(u|0x0D); delay(1000); I2C_Write_Wait(u|0x09); delay(1000);
+    I2C_Write_Wait(l|0x0D); delay(1000); I2C_Write_Wait(l|0x09); delay(1000);
+}
+
+void LCD_Init(void) {
+    delay(1000000); LCD_SendCommand(0x33); LCD_SendCommand(0x32);
+    LCD_SendCommand(0x28); LCD_SendCommand(0x0C); LCD_SendCommand(0x01); delay(200000);
+}
+
+void LCD_SendString(char *str) { while (*str) LCD_SendData(*str++); }
+void LCD_Clear(void) { LCD_SendCommand(0x01); delay(100000); }
+void LCD_SetCursor(uint8_t row, uint8_t col) { LCD_SendCommand(row == 0 ? (0x80 + col) : (0xC0 + col)); }
+
+/* --- Choice Display Helpers --- */
+void show_player_choice(Choice c) {
+    GPIOA->ODR |= (1 << 8) | (1 << 9) | (1 << 10);
+    if (c == ROCK) GPIOA->ODR &= ~(1 << 8);
+    else if (c == PAPER) GPIOA->ODR &= ~(1 << 9);
+    else if (c == SCISSORS) GPIOA->ODR &= ~(1 << 10);
+}
+
+void show_system_choice(Choice c) {
+    GPIOB->ODR &= ~((1 << 12) | (1 << 13) | (1 << 14));
+    if (c == ROCK) GPIOB->ODR |= (1 << 12);
+    else if (c == PAPER) GPIOB->ODR |= (1 << 13);
+    else if (c == SCISSORS) GPIOB->ODR |= (1 << 14);
+}
+
+/* --- Blink Helpers --- */
+void blink_active_low(GPIO_TypeDef *port, uint32_t pin, int times) {
+    for (int i = 0; i < times; i++) {
+        port->ODR &= ~(1 << pin); delay(800000);
+        port->ODR |= (1 << pin);  delay(800000);
+    }
+}
+
+void blink_active_high(GPIO_TypeDef *port, uint32_t pin, int times) {
+    for (int i = 0; i < times; i++) {
+        port->ODR |= (1 << pin);  delay(800000);
+        port->ODR &= ~(1 << pin); delay(800000);
+    }
+}
+
+void delay(volatile uint32_t t) { while (t--); }
